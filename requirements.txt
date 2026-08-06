@@ -1,2 +1,5 @@
-mcp[cli]>=1.0.0
+# mcp 2.0 removed mcp.server.fastmcp: the high-level class is now MCPServer in
+# mcp.server.mcpserver. The old floor of >=1.0.0 meant a rebuild silently jumped
+# major versions and broke the import.
+mcp>=2.0.0,<3
 lxml>=5.2.0

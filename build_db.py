@@ -13,73 +13,13 @@ import sys
 import time
 from lxml import etree
 
+import db as db_module
+
 
 # ── Schema ────────────────────────────────────────────────────────────────────
 
-DDL = """
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous  = NORMAL;
-
-CREATE TABLE IF NOT EXISTS documents (
-    id          TEXT PRIMARY KEY,
-    dossier_id  TEXT,
-    year        INTEGER,
-    source      TEXT,
-    location    TEXT,         -- WKT POINT(E N) or NULL
-    language    TEXT,
-    pages       INTEGER,
-    text_raw    TEXT,         -- full document text from metadata/@text
-    checked     INTEGER       -- 0/1
-);
-
-CREATE TABLE IF NOT EXISTS spans (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    doc_id      TEXT REFERENCES documents(id),
-    span_id     TEXT,
-    parent_id   TEXT,         -- for nested spans
-    class       TEXT,         -- per, loc, org, date, money, …
-    element     TEXT,         -- reference, head, value, trigger
-    text        TEXT,
-    confidence  REAL,
-    token_start INTEGER,
-    token_end   INTEGER,
-    numerus     TEXT,
-    specificity TEXT,
-    subclass    TEXT,
-    norm        TEXT          -- normalised value (money, date)
-);
-
-CREATE TABLE IF NOT EXISTS events (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    doc_id      TEXT REFERENCES documents(id),
-    event_id    TEXT,
-    class       TEXT,
-    token_start INTEGER,
-    token_end   INTEGER,
-    tense       TEXT,
-    polarity    TEXT,
-    modality    TEXT
-);
-
--- Full-text search tables
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_documents USING fts5(
-    id UNINDEXED, text_raw, content=documents, content_rowid=rowid
-);
-CREATE VIRTUAL TABLE IF NOT EXISTS fts_spans USING fts5(
-    doc_id UNINDEXED, span_id UNINDEXED, class UNINDEXED,
-    text, content=spans, content_rowid=rowid
-);
-"""
-
-TRIGGERS = """
-CREATE TRIGGER IF NOT EXISTS docs_ai AFTER INSERT ON documents BEGIN
-    INSERT INTO fts_documents(rowid, id, text_raw) VALUES (new.rowid, new.id, new.text_raw);
-END;
-CREATE TRIGGER IF NOT EXISTS spans_ai AFTER INSERT ON spans BEGIN
-    INSERT INTO fts_spans(rowid, doc_id, span_id, class, text)
-    VALUES (new.rowid, new.doc_id, new.span_id, new.class, new.text);
-END;
-"""
+DDL = db_module.SCHEMA_SQL
+TRIGGERS = db_module.TRIGGERS_SQL
 
 
 def init_db(path: str) -> sqlite3.Connection:
