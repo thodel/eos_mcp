@@ -53,23 +53,36 @@ reverse proxy, set it to the public path** — see [Reverse proxy](#reverse-prox
 
 ### 4. Connect a client
 
-Add to your `claude_desktop_config.json` (or equivalent):
+**Claude Code** — the name and URL are positional; there is no `--url` flag:
+
+```bash
+claude mcp add --transport http hgb http://<server-ip>:8000/mcp -s user
+```
+
+`-s user` makes the server available in every project; `-s project` writes it to
+`.mcp.json` to share with a repository; the default `local` scope is just you, in the
+current project. `claude mcp list` then reports the connection status.
+
+**Claude Desktop, Cowork, claude.ai** — Customize → Connectors → **+** → *Add custom
+connector*, and paste the same URL. These clients connect from Anthropic's cloud rather
+than from your machine, so the server has to be reachable over the public internet;
+`claude_desktop_config.json` only configures local stdio servers, not remote URLs.
+
+**Project-scoped `.mcp.json`:**
 
 ```json
 {
   "mcpServers": {
     "hgb": {
-      "url": "http://<server-ip>:8000/mcp",
-      "transport": "streamable-http"
+      "type": "http",
+      "url": "http://<server-ip>:8000/mcp"
     }
   }
 }
 ```
 
-Or for Claude Code:
-```bash
-claude mcp add hgb --transport http --url http://<server-ip>:8000/mcp
-```
+`type` is required, and `streamable-http` is accepted as an alias for `http`. An entry
+with a `url` but no `type` is read as a stdio server and skipped with an error.
 
 ---
 
