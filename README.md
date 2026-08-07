@@ -204,6 +204,18 @@ raise `too many SQL variables`.
 roughly 150,000 characters. `get_dossier` is bounded because it carries every
 document's full `text_raw`, and `get_document` caps spans and events at 2000 each.
 
+## Deployment
+
+This server runs on `tei.dh.unibe.ch` at
+**`https://tei.dh.unibe.ch/mcp/eos/mcp`**, alongside four sibling MCP servers:
+[Königsfelden](https://github.com/thodel/kf_mcp), [SSRQ](https://github.com/thodel/ssrq_mcp), [HLS](https://github.com/thodel/hls_mcp), [HBLS](https://github.com/thodel/hbls_mcp).
+
+What they share — the nginx routing, the landing pages, and the deploy sequence —
+lives in **[tei_mcp_ops](https://github.com/thodel/tei_mcp_ops)**. Start there for
+anything that spans the fleet; in particular, the app's `--http-path` and the nginx
+`location` have to be the same string, which is the rule a sub-path deployment turns
+on.
+
 ## Tests
 
 ```bash
