@@ -48,6 +48,38 @@ mcp = MCPServer(
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 @mcp.tool()
+def search_semantic(query: str, limit: int = 20, year_from: int = 0,
+                    year_to: int = 0, per_document: int = 2) -> list[dict]:
+    """Land-register passages that answer a question, matched by meaning.
+
+    The reason this server embeds its own corpus. Measured before it was built:
+    a question in modern German returned zero keyword hits against this
+    material, because the entries are tokenised medieval German with high
+    edition noise and the caller would have to know the scribe's spelling.
+
+    `year_from`/`year_to` restrict to a period. `per_document` caps how many
+    passages one entry may contribute.
+    """
+    import embeddings as emb
+
+    vector = emb.embed_query(query)
+    return db_module.search_semantic(
+        vector, limit=limit, year_from=year_from or None,
+        year_to=year_to or None, per_document=per_document)
+
+
+@mcp.tool()
+def semantic_index_stats() -> dict:
+    """Whether the semantic index is built, and over how much of the corpus.
+
+    Worth checking before trusting an empty result: coverage below 1.0 means
+    passages are missing, not that the corpus has nothing to say.
+    """
+    return db_module.semantic_stats()
+
+
+
+@mcp.tool()
 def corpus_stats() -> dict:
     """High-level counts for the HGB corpus, plus the year range covered."""
     return db_module.db_stats()

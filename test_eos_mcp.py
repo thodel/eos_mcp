@@ -423,3 +423,106 @@ if __name__ == "__main__":
     print(f"\n{'═'*50}")
     print(f"{GREEN}ALL PASSED{RESET}" if ok_all else f"{RED}FAILURES{RESET}")
     sys.exit(0 if ok_all else 1)
+
+
+# ── Semantic search ───────────────────────────────────────────────────────────
+# Written before this shipped, deliberately. Porting the same machinery into
+# ssrq_mcp produced four failures in a row — a module missing from the image, a
+# missing module constant, another corpus's columns in the SQL, and a row key
+# that did not match the alias. Every one surfaced to the caller as the same
+# opaque "Error executing tool search_semantic". One test over a real database
+# with real vectors catches all four.
+
+def _semantic_db(tmp_path):
+    import sqlite3
+    import struct
+
+    import db
+
+    path = tmp_path / "semantic.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(db.SCHEMA_SQL)
+    conn.executescript(db.EMBEDDING_SCHEMA_SQL)
+    conn.execute(
+        "INSERT INTO documents (id, dossier_id, year, source, location, language, "
+        "pages, text_raw, checked) VALUES "
+        "('doc-1','HGB 42',1512,'StABS',NULL,'de',2,"
+        "'Item hat Hans Meyer sin hus by dem Rhyn verkoufft.',1)")
+    conn.execute(
+        "INSERT INTO chunks (chunk_id, doc_id, chunk_index, char_start, char_end, text) "
+        "VALUES ('doc-1#0','doc-1',0,0,48,"
+        "'Item hat Hans Meyer sin hus by dem Rhyn verkoufft.')")
+    dims = 8
+    vector = [1.0] + [0.0] * (dims - 1)
+    conn.execute(
+        "INSERT INTO embeddings (chunk_id, model, dims, vector) VALUES (?,?,?,?)",
+        ("doc-1#0", "test-model", dims, struct.pack(f"<{dims}f", *vector)))
+    conn.commit(); conn.close()
+    db.set_db_path(str(path))
+    db._VECTOR_CACHE.clear()
+    return db, vector
+
+
+def test_search_semantic_end_to_end(tmp_path):
+    db, vector = _semantic_db(tmp_path)
+
+    hits = db.search_semantic(vector, limit=5, model="test-model")
+
+    assert len(hits) == 1
+    hit = hits[0]
+    assert hit["id"] == "doc-1"
+    assert hit["year"] == 1512
+    # The HGB has no titles: an entry is placed by its dossier.
+    assert hit["dossier_id"] == "HGB 42"
+    assert hit["score"] > 0.99
+
+
+def test_the_year_filter_works(tmp_path):
+    db, vector = _semantic_db(tmp_path)
+
+    assert db.search_semantic(vector, model="test-model", year_from=1600) == []
+    assert len(db.search_semantic(vector, model="test-model", year_to=1600)) == 1
+
+
+def test_semantic_stats_reports_coverage(tmp_path):
+    db, _ = _semantic_db(tmp_path)
+
+    stats = db.semantic_stats()
+
+    assert stats["n_chunks"] == 1
+    assert stats["indexed"] is True
+
+
+def test_every_sql_statement_matches_the_schema(tmp_path):
+    """A missing column only shows when the statement runs, and inside a tool
+    that reaches the caller as an opaque failure."""
+    import sqlite3
+
+    import db
+
+    conn = sqlite3.connect(tmp_path / "schema.db")
+    conn.executescript(db.SCHEMA_SQL)
+    conn.executescript(db.EMBEDDING_SCHEMA_SQL)
+    conn.execute(db._SEMANTIC_SQL.format(placeholders="?"), ("x",)).fetchall()
+    conn.close()
+
+
+def test_every_module_is_copied_into_the_image():
+    """The Dockerfile lists modules individually rather than `COPY . .`.
+
+    hls_mcp shipped without embeddings.py: the build succeeded and the
+    container crash-looped on the import, taking the largest provider in the
+    federation offline. Only COPY lines are scanned — an earlier version of
+    this check elsewhere matched the module name in its own comment and passed
+    with the COPY removed.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent
+    copy_lines = [line for line in (root / "Dockerfile").read_text(encoding="utf-8").splitlines()
+                  if line.strip().startswith("COPY")]
+    copied = set(re.findall(r"([\w]+\.py)", " ".join(copy_lines)))
+    shipped = {p.name for p in root.glob("*.py")
+               if not p.name.startswith("test_") and p.name != "embed_db.py"}
+    assert not shipped - copied, f"not COPYed into the image: {sorted(shipped - copied)}"

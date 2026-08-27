@@ -3,3 +3,8 @@
 # major versions and broke the import.
 mcp>=2.0.0,<3
 lxml>=5.2.0
+
+# The semantic index: vectors come through the OpenAI-compatible GPUStack
+# API and are compared as a brute-force dot product over a numpy array.
+numpy
+openai
