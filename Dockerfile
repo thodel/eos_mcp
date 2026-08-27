@@ -7,7 +7,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy server code
-COPY build_db.py db.py server.py ./
+# embeddings.py is imported by search_semantic. Modules are listed one by
+# one to keep the image small, which means a new one has to be added here
+# too — hls_mcp shipped without its and crash-looped on the import, with a
+# clean build and no warning.
+COPY build_db.py db.py server.py embeddings.py ./
 
 # hgb.db is mounted at runtime (see docker-compose.yml)
 # Build it first with: docker run --rm -v /path/to/data:/data hgb-mcp python build_db.py --xml /data/hgb_full.xml --db /data/hgb.db
