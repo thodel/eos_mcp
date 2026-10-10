@@ -359,6 +359,10 @@ def test_server(base_url):
                                                                {"doc_id": "definitely_not_an_id"}))
                 tr.check(isinstance(payload, dict) and "error" in payload,
                          f"unknown document id returns an error object (got {payload})")
+                # Der Text allein ist nicht maschinell von einem Ausfall zu
+                # unterscheiden; das Feld ist es (ch-h-bot#497).
+                tr.check(isinstance(payload, dict) and payload.get("not_found") is True,
+                         f"unknown document id says so in `not_found` (got {payload})")
 
                 payload = _tool_payload(await session.call_tool(
                     "get_persons_in_year_range", {"year_from": 1600, "year_to": 1500}))

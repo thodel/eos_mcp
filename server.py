@@ -95,7 +95,10 @@ def get_document(doc_id: str) -> dict:
     """Full document: metadata, raw text, all annotated spans, and all events."""
     result = db_module.get_document(doc_id)
     if not result:
-        return {"error": f"Document '{doc_id}' not found."}
+        # `not_found`: «kenne ich nicht» maschinell von einem Ausfall zu
+        # unterscheiden (ch-h-bot#497). Der Text bleibt, weil dieser Server
+        # auch direkt von Menschen und Modellen gefragt wird.
+        return {"error": f"Document '{doc_id}' not found.", "not_found": True}
     return result
 
 @mcp.tool()
@@ -103,7 +106,7 @@ def get_dossier(dossier_id: str, limit: int = 100) -> list[dict]:
     """All documents belonging to one dossier (a property's file), oldest first."""
     results = db_module.get_dossier(dossier_id, limit)
     if not results:
-        return [{"error": f"Dossier '{dossier_id}' not found."}]
+        return [{"error": f"Dossier '{dossier_id}' not found.", "not_found": True}]
     return results
 
 @mcp.tool()
@@ -145,7 +148,8 @@ def resource_dossiers() -> str:
 def resource_document(doc_id: str) -> str:
     result = db_module.get_document(doc_id)
     if not result:
-        return json.dumps({"error": f"Document '{doc_id}' not found."})
+        return json.dumps({"error": f"Document '{doc_id}' not found.",
+                           "not_found": True})
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 # ── Entry point ───────────────────────────────────────────────────────────────
