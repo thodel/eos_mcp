@@ -60,9 +60,9 @@ def search_semantic(query: str, limit: int = 20, year_from: int = 0,
     `year_from`/`year_to` restrict to a period. `per_document` caps how many
     passages one entry may contribute.
     """
-    import embeddings as emb
+    import corpus
 
-    vector = emb.embed_query(query)
+    vector = corpus.embed_query(query)
     return db_module.search_semantic(
         vector, limit=limit, year_from=year_from or None,
         year_to=year_to or None, per_document=per_document)

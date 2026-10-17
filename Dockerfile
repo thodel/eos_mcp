@@ -11,11 +11,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # one to keep the image small, which means a new one has to be added here
 # too — hls_mcp shipped without its and crash-looped on the import, with a
 # clean build and no warning.
-COPY build_db.py db.py server.py embeddings.py ./
+COPY build_db.py db.py server.py corpus.py embeddings.py ./
 
 # hgb.db is mounted at runtime (see docker-compose.yml)
 # Build it first with: docker run --rm -v /path/to/data:/data hgb-mcp python build_db.py --xml /data/hgb_full.xml --db /data/hgb.db
 
 EXPOSE 8000
+
+# embeddings.py is vendored across the fleet and reads EOS_* settings by this prefix.
+ENV MCP_ENV_PREFIX=EOS
 
 CMD ["python", "server.py", "--db", "/data/hgb.db", "--host", "0.0.0.0", "--port", "8000"]
