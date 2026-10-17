@@ -12,7 +12,7 @@ Run it after build_db.py:
 
 The expansion vocabulary is built from the whole corpus before chunking, not
 per entry — deciding whether "Hein" is a fragment or a name needs evidence from
-everywhere the token occurs (see embeddings.build_vocab).
+everywhere the token occurs (see corpus.build_vocab).
 
 The run is **resumable**: chunks already embedded with the same model are
 skipped, so an interrupted run continues where it stopped rather than starting
@@ -33,6 +33,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+import corpus
 import db as db_module
 import embeddings as emb
 
@@ -55,7 +56,7 @@ def build_chunks(conn: sqlite3.Connection, limit: int | None,
     # ones in this batch.
     if not quiet:
         print("  building expansion vocabulary …", file=sys.stderr)
-    vocab = emb.build_vocab(
+    vocab = corpus.build_vocab(
         t for (t,) in conn.execute(
             "SELECT text_raw FROM documents WHERE text_raw IS NOT NULL"))
 
@@ -72,9 +73,9 @@ def build_chunks(conn: sqlite3.Connection, limit: int | None,
     written = 0
     batch: list[tuple] = []
     for doc_id, dossier_id, year, text in rows:
-        cleaned = emb.clean_entry_text(text, vocab)
+        cleaned = corpus.clean_entry_text(text, vocab)
         for index, (start, end, piece) in enumerate(
-                emb.chunk_article(cleaned, size, overlap)):
+                emb.chunk_document(cleaned, size, overlap)):
             # Title and year ride on the first line of every passage. A charter
             # passage otherwise carries no trace of which document or century it
             # belongs to, and "the farm at Lind" reads the same in 1360 as 1644.

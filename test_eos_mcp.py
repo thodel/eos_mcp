@@ -394,6 +394,48 @@ def cli_run(label, fn, *fn_args):
         return False
 
 
+# ── The vendored embeddings.py ───────────────────────────────────────────────
+
+@pytest.mark.parametrize("entry", ["server", "embed_db"])
+def test_the_vendored_embeddings_read_the_eos_settings(entry):
+    # embeddings.py is byte-identical across the fleet and finds EOS_EMBED_MODEL
+    # and the other EOS_* settings only through MCP_ENV_PREFIX, which corpus.py
+    # sets before importing it. Without that, an override would be read by
+    # nothing and queries would be embedded with a model the index was not
+    # built with.
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if k != "MCP_ENV_PREFIX"}
+    env["EOS_EMBED_MODEL"] = "probe-model"
+    out = subprocess.run(
+        [sys.executable, "-c",
+         # server.py imports corpus inside search_semantic, the first place
+         # it needs a vector; this is that order.
+         f"import {entry}, corpus, embeddings; "
+         "print(embeddings.ENV_PREFIX, embeddings.DEFAULT_MODEL)"],
+        cwd=os.path.dirname(os.path.abspath(__file__)), env=env,
+        capture_output=True, text=True)
+    assert out.stdout.split() == ["EOS", "probe-model"], out.stderr
+
+
+def test_queries_carry_this_corpus_instruction():
+    # The shared embed_query only knows "Swiss history"; corpus.embed_query
+    # keeps the instruction this index has always been queried with.
+    import corpus as corpus_module
+    seen = {}
+
+    class FakeClient:
+        class embeddings:
+            @staticmethod
+            def create(model, input):
+                seen["input"] = input
+                return type("R", (), {"data": [type("D", (), {"embedding": [1.0, 0.0]})()]})()
+
+    corpus_module.embed_query("Wer?", client=FakeClient())
+    assert seen["input"][0].startswith("Instruct:")
+    assert "land-register" in seen["input"][0]
+    assert seen["input"][0].endswith("Wer?")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="EOS MCP test suite")
     ap.add_argument("--unit", action="store_true", help="Run unit tests")
