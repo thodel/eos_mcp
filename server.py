@@ -63,9 +63,11 @@ def search_semantic(query: str, limit: int = 20, year_from: int = 0,
     import corpus
 
     vector = corpus.embed_query(query)
+    # The tool keeps saying `per_document` — that is what a passage of this
+    # corpus belongs to; the shared vectorstore calls the same cap per_parent.
     return db_module.search_semantic(
         vector, limit=limit, year_from=year_from or None,
-        year_to=year_to or None, per_document=per_document)
+        year_to=year_to or None, per_parent=per_document)
 
 
 @mcp.tool()

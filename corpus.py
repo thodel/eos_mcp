@@ -7,11 +7,9 @@ embeddings.py is vendored byte-identical across the fleet (see ch-h-bot
 docs/MCP_PROVIDER_PATTERN.md); whatever is particular to this corpus lives
 here instead, so that the shared file can stay a checksum.
 
-This repo is on the older layout: embed_db.py and the semantic search in db.py
-are its own, not the shared ones. Its index stores `chunks.doc_id` (the
-shared schema says `parent_id`) and puts a heading (title, year) on the first
-line of every passage, which the shared embed_db.py cannot do. Moving to the shared files is
-a schema migration plus a full re-embed, so it is a deployment, not a sync.
+embed_db.py and vectorstore.py are shared the same way (since #6). What they
+ask of a corpus is at the bottom of this file: where the database is, which
+table the passages belong to, how to iterate it, and how to clean a text.
 """
 
 from __future__ import annotations
@@ -25,6 +23,12 @@ import unicodedata
 os.environ.setdefault("MCP_ENV_PREFIX", "EOS")
 
 import embeddings as emb  # noqa: E402
+
+# What the shared embed_db.py reads: where the corpus is and what a passage
+# belongs to. server.py has the same default for the same reason.
+DB_ENV = "EOS_DB"
+DEFAULT_DB = "/data/hgb.db"
+PARENT_TABLE = "documents"
 
 # Qwen3-Embedding is instruction-aware: queries carry a task instruction and
 # documents do not. This one names the corpus; the shared default only says
@@ -137,3 +141,61 @@ def embed_query(query: str, model: str = emb.DEFAULT_MODEL, client=None) -> list
     if not vectors:
         raise emb.EmbeddingError("the embedding service returned no vector for the query")
     return vectors[0]
+
+
+# ── What the shared embed_db.py asks of this corpus ─────────────────────────
+#
+# iter_documents yields (id, head, text); embed_db.py cleans and windows the
+# text and puts the head, verbatim, on the first line of every passage. The
+# vocabulary for clean() is corpus-wide state, built by iter_documents before
+# its first document — not per entry, and not over the sample a --limit asks
+# for: deciding whether "Hein" is a fragment or a name needs evidence from
+# everywhere the token occurs, and that is how the index on idhefix was built
+# and how ch-h-bot#555 measured all 76,737 passages row-identical.
+
+_VOCAB: dict | None = None
+
+
+def head_line(dossier_id, year) -> str:
+    """Die Kopfzeile jeder Passage: Dossier und Jahr, sonst nichts.
+
+    Das HGB hat keine Titel; ein Eintrag wird über sein Dossier und sein Jahr
+    eingeordnet, und «der Hof zu Lind» liest sich 1360 wie 1644. Wörtlich,
+    ohne strip(): die Vektoren sind aus genau dieser Zeile gemacht, und ein
+    Dossier mit Leerzeichen am Rand ergäbe sonst eine andere (ch-h-bot#555:
+    ein strip() kostete hls 11 Passagen). Leer, wenn beides fehlt — dann trägt
+    die Passage keinen Kopf. Eine Funktion, damit db.passage_body genau den
+    Kopf abschneidet, den embed_db.py schreibt.
+    """
+    return " ".join(str(x) for x in (dossier_id, year) if x)
+
+
+def iter_documents(conn, limit=None):
+    """Yield (id, head, text_raw) for every document that has a text.
+
+    Builds the expansion vocabulary over the WHOLE table first, whatever
+    ``limit`` says (see above); the shared build_chunks calls this before its
+    first clean(), so the order holds.
+    """
+    global _VOCAB
+    _VOCAB = build_vocab(
+        t for (t,) in conn.execute(
+            "SELECT text_raw FROM documents WHERE text_raw IS NOT NULL"))
+    sql = ("SELECT id, dossier_id, year, text_raw FROM documents "
+           "WHERE text_raw IS NOT NULL AND text_raw <> '' ORDER BY id")
+    rows = conn.execute(sql + (" LIMIT ?" if limit else ""),
+                        (limit,) if limit else ()).fetchall()
+    for doc_id, dossier_id, year, text in rows:
+        yield doc_id, head_line(dossier_id, year), text
+
+
+def clean(text: str) -> str:
+    """The expanded reading, with the vocabulary iter_documents built.
+
+    Refuses rather than guessing: with an empty vocabulary nothing would ever
+    be joined, and the passages would differ from the index without a word.
+    """
+    if _VOCAB is None:
+        raise RuntimeError("corpus.clean needs the corpus vocabulary; "
+                           "iter_documents builds it before its first document")
+    return clean_entry_text(text, _VOCAB)
