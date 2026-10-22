@@ -173,6 +173,8 @@ Two failure modes, both returning a bare `Not Found` or `405`:
 | `get_persons_in_year_range(year_from, year_to, limit)` | Person mentions filtered by year |
 | `get_cooccurrences(person_name, limit)` | Other persons in the same documents |
 | `list_dossiers(limit)` | All properties with coordinates and year ranges |
+| `search_semantic(query, limit, year_from, year_to, per_document)` | Passages that answer a question, matched by meaning (see [Semantic index](#semantic-index)) |
+| `semantic_index_stats()` | Whether the index is built and over how much of the corpus (`n_chunks`, `n_indexed`, `n_total`, `coverage`, `models`, `recent_runs`) |
 
 ## Available resources
 
@@ -204,6 +206,49 @@ raise `too many SQL variables`.
 roughly 150,000 characters. `get_dossier` is bounded because it carries every
 document's full `text_raw`, and `get_document` caps spans and events at 2000 each.
 
+## Semantic index
+
+`search_semantic` answers from passage vectors stored in `hgb.db` next to the
+corpus (`chunks`, `embeddings`, `embedding_runs`). The machinery is the fleet's,
+vendored byte-identical from [eperiodica_mcp](https://github.com/thodel/eperiodica_mcp)
+and checked by `scripts/check_vendored_drift.py` in ch-h-bot:
+
+| File | Role |
+|------|------|
+| `embeddings.py` | GPUStack client, windowing, vector packing — reads `EOS_*` settings via `MCP_ENV_PREFIX=EOS` |
+| `embed_db.py` | builds the index: chunks, embeds, records the run; resumable |
+| `vectorstore.py` | the shared schema, the matrix, the search, the stats |
+| `corpus.py` | **this repo's own**: `iter_documents`, the head line `dossier_id year` on every passage, `clean` (the expanded reading), the query instruction |
+
+```bash
+GPUSTACK_API_KEY=... python embed_db.py --db hgb.db            # whole corpus
+GPUSTACK_API_KEY=... python embed_db.py --db hgb.db --limit 100
+python embed_db.py --db hgb.db --status                         # nothing pending?
+```
+
+Every passage carries `dossier_id year` on its first line — for the vector, which
+otherwise cannot tell 1360 from 1644. A hit's `snippet` is the passage **without**
+that line (`db.passage_body`, the fleet rule from ch-h-bot#555); `char_start`/`char_end`
+point into the cleaned text and are unaffected.
+
+### Migrating an index built before #6
+
+Until #6 this repo had its own `embed_db.py`, and the index named a passage's document
+`chunks.doc_id` (index `ix_chunks_entry`) and counted `embedding_runs.n_articles`. The
+shared files say `parent_id`, `ix_chunks_parent`, `n_parents`. **The vectors stay**:
+measured in ch-h-bot#555, all 76,737 production passages come out row-identical from
+the shared `embed_db.py`, so the migration is a rename, not a re-embed.
+
+```bash
+# the server must be stopped: the old db.py asks for doc_id, the new one for parent_id
+cp hgb.db hgb.db.pre-parent-id                 # your backup — the script makes none
+python migrate_parent_id.py --db hgb.db        # one transaction, then integrity_check
+python embed_db.py --db hgb.db --status        # n_chunks unchanged, coverage unchanged
+```
+
+The script is idempotent and prints the counts before and after; then `git pull`
+and start the server. A second run reports `already migrated, nothing to do`.
+
 ## Deployment
 
 This server runs on `tei.dh.unibe.ch` at
@@ -224,6 +269,8 @@ pytest test_eos_mcp.py
 ```
 
 Unit tests build their own throwaway database from `db.SCHEMA_SQL` and need no setup.
+The semantic tests carry the rows the old `embed_db.py` wrote for a fixture (frozen at
+119a782), so the shared `embed_db.py` plus `corpus.py` is held to the index on disk.
 DB and server tests skip unless pointed at them:
 
 ```bash

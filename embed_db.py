@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 """
-embed_db.py — build the semantic index into kf.db.
+embed_db.py — build the semantic index. Shared, vendored, byte-identical.
 
-Resolves each entry's transcription to its expanded reading, windows it into
-passages, embeds them on GPUStack, and stores the vectors alongside the corpus.
-Run it after build_db.py:
+    GPUSTACK_API_KEY=... python embed_db.py                 # whole corpus
+    GPUSTACK_API_KEY=... python embed_db.py --limit 500     # a sample first
+    GPUSTACK_API_KEY=... python embed_db.py --recompute     # after a model change
+    python embed_db.py --status
 
-    GPUSTACK_API_KEY=... python embed_db.py                    # full corpus
-    GPUSTACK_API_KEY=... python embed_db.py --limit 100        # a sample first
-    GPUSTACK_API_KEY=... python embed_db.py --recompute        # after a model change
+Resumable: chunks already embedded with the same model are skipped and every
+batch is committed, so an interrupted run continues rather than starting over.
+Chunking is deterministic, so re-running produces the same chunk ids.
 
-The expansion vocabulary is built from the whole corpus before chunking, not
-per entry — deciding whether "Hein" is a fragment or a name needs evidence from
-everywhere the token occurs (see corpus.build_vocab).
+A repo supplies `corpus.py` with:
+    DB_ENV, DEFAULT_DB, PARENT_TABLE   what and where its corpus is
+    iter_documents(conn, limit)        -> (parent_id, embedding_text)
+                                       or (parent_id, heading, embedding_text)
+    clean(text)                        -> optional corpus-specific cleanup
+Everything below is the same everywhere.
 
-The run is **resumable**: chunks already embedded with the same model are
-skipped, so an interrupted run continues where it stopped rather than starting
-over. Chunking is deterministic, so re-running produces the same chunk ids.
-
-Each run is recorded in `embedding_runs` with the model, dimensions and window
-settings that produced the vectors — an answer's evidence should be traceable
-to the process that indexed it, not just to the article.
+A heading — title, year, pages, whatever says what a passage is from — goes on
+the first line of EVERY passage of its document, not only the first: a window
+lifted from page 14 of a twenty-page article otherwise embeds as if it were
+anonymous. It is not part of the text that is cleaned and windowed, so offsets
+point into clean(text) and a hit can be located in its document, and it does
+not count against the window size. Corpora that yield pairs get no heading and
+exactly the chunks they got before.
 """
 
 from __future__ import annotations
@@ -34,59 +38,38 @@ import uuid
 from datetime import datetime, timezone
 
 import corpus
-import db as db_module
 import embeddings as emb
+import vectorstore
 
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create the chunk/embedding tables in a database built before they existed."""
-    conn.executescript(db_module.EMBEDDING_SCHEMA_SQL)
-    conn.commit()
+def split_document(item) -> tuple:
+    """(parent_id, heading, text) from what iter_documents yielded."""
+    if len(item) == 2:
+        return item[0], "", item[1]
+    if len(item) == 3:
+        # Verbatim: the corpus formats its heading, and the stored text has to
+        # stay what the vectors were made from. Blank means none.
+        heading = item[1] or ""
+        return item[0], heading if heading.strip() else "", item[2]
+    raise ValueError("iter_documents must yield (parent_id, text) or "
+                     f"(parent_id, heading, text), not {len(item)} values")
 
 
-def build_chunks(conn: sqlite3.Connection, limit: int | None,
-                 size: int, overlap: int, quiet: bool) -> int:
-    """Window every entry that has no chunks yet. Returns the number written."""
-    # Built over the entire corpus, including entries already chunked: the
-    # fragment/word judgement needs every occurrence of a token, not just the
-    # ones in this batch.
-    if not quiet:
-        print("  building expansion vocabulary …", file=sys.stderr)
-    vocab = corpus.build_vocab(
-        t for (t,) in conn.execute(
-            "SELECT text_raw FROM documents WHERE text_raw IS NOT NULL"))
-
-    rows = conn.execute(
-        """
-        SELECT e.id, e.dossier_id, e.year, e.text_raw
-        FROM documents e
-        WHERE e.text_raw IS NOT NULL AND e.text_raw <> ''
-          AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = e.id)
-        ORDER BY e.id
-        """ + (" LIMIT ?" if limit else ""),
-        (limit,) if limit else ()).fetchall()
-
-    written = 0
-    batch: list[tuple] = []
-    for doc_id, dossier_id, year, text in rows:
-        cleaned = corpus.clean_entry_text(text, vocab)
+def build_chunks(conn, limit, size, overlap, quiet) -> int:
+    written, batch = 0, []
+    clean = getattr(corpus, "clean", None)
+    for item in corpus.iter_documents(conn, limit):
+        parent_id, heading, text = split_document(item)
         for index, (start, end, piece) in enumerate(
-                emb.chunk_document(cleaned, size, overlap)):
-            # Title and year ride on the first line of every passage. A charter
-            # passage otherwise carries no trace of which document or century it
-            # belongs to, and "the farm at Lind" reads the same in 1360 as 1644.
-            # No title in this corpus; the dossier and year are what a
-            # reader has to place an entry by.
-            head = " ".join(str(x) for x in (dossier_id, year) if x)
-            body = f"{head}\n{piece}" if head else piece
-            batch.append((f"{doc_id}#{index}", doc_id, index, start, end, body))
+                emb.chunk_document(text, size, overlap, clean=clean)):
+            batch.append((f"{parent_id}#{index}", str(parent_id), index,
+                          start, end, f"{heading}\n{piece}" if heading else piece))
         if len(batch) >= 5000:
-            conn.executemany(
-                "INSERT OR IGNORE INTO chunks VALUES (?,?,?,?,?,?)", batch)
+            conn.executemany("INSERT OR IGNORE INTO chunks VALUES (?,?,?,?,?,?)", batch)
             conn.commit()
             written += len(batch)
             batch.clear()
@@ -99,18 +82,39 @@ def build_chunks(conn: sqlite3.Connection, limit: int | None,
     return written
 
 
-def embed_pending(conn: sqlite3.Connection, model: str, batch_size: int,
-                  quiet: bool) -> tuple[int, int]:
-    """Embed every chunk lacking a vector for ``model``. Returns (n_chunks, dims)."""
-    pending = conn.execute(
-        """
-        SELECT c.chunk_id, c.text
-        FROM chunks c
-        LEFT JOIN embeddings e ON e.chunk_id = c.chunk_id AND e.model = ?
-        WHERE e.chunk_id IS NULL
-        ORDER BY c.chunk_id
-        """, (model,)).fetchall()
+def reuse_vectors(conn, reuse_db: str, model: str, quiet: bool) -> int:
+    """Copy vectors from a previous index for chunks whose text is unchanged.
 
+    A nightly rebuild starts from an empty staging database and used to
+    re-embed the whole corpus — 647,000 chunks, forty minutes of GPU — for
+    the few thousand pages read since yesterday, and a dropped connection
+    in minute thirty threw all of it away (2026-09-10). Chunk ids are
+    deterministic (parent#index) and the text is compared, so a chunk gets
+    its old vector only if it is the same chunk; what changed or is new is
+    embedded as before.
+    """
+    conn.execute("ATTACH DATABASE ? AS prev", (reuse_db,))
+    try:
+        copied = conn.execute(
+            "INSERT OR IGNORE INTO main.embeddings (chunk_id, model, dims, vector) "
+            "SELECT e.chunk_id, e.model, e.dims, e.vector "
+            "FROM prev.embeddings e "
+            "JOIN prev.chunks pc ON pc.chunk_id = e.chunk_id "
+            "JOIN main.chunks c ON c.chunk_id = pc.chunk_id AND c.text = pc.text "
+            "WHERE e.model = ?", (model,)).rowcount
+        conn.commit()
+    finally:
+        conn.execute("DETACH DATABASE prev")
+    if not quiet:
+        print(f"  reused {copied:,} vectors from {reuse_db}", file=sys.stderr)
+    return copied
+
+
+def embed_pending(conn, model, batch_size, quiet) -> tuple[int, int]:
+    pending = conn.execute(
+        "SELECT c.chunk_id, c.text FROM chunks c "
+        "LEFT JOIN embeddings e ON e.chunk_id = c.chunk_id AND e.model = ? "
+        "WHERE e.chunk_id IS NULL ORDER BY c.chunk_id", (model,)).fetchall()
     total = len(pending)
     if not total:
         return 0, 0
@@ -121,8 +125,7 @@ def embed_pending(conn: sqlite3.Connection, model: str, batch_size: int,
     done, dims, t0 = 0, 0, time.time()
     for offset in range(0, total, batch_size):
         window = pending[offset:offset + batch_size]
-        vectors = emb.embed_texts([text for _, text in window],
-                                  model=model, client=client)
+        vectors = emb.embed_texts([t for _, t in window], model=model, client=client)
         if len(vectors) != len(window):
             raise emb.EmbeddingError(
                 f"asked for {len(window)} vectors, got {len(vectors)}")
@@ -130,31 +133,31 @@ def embed_pending(conn: sqlite3.Connection, model: str, batch_size: int,
         conn.executemany(
             "INSERT OR REPLACE INTO embeddings (chunk_id, model, dims, vector) "
             "VALUES (?,?,?,?)",
-            [(chunk_id, model, dims, emb.pack(vector))
-             for (chunk_id, _), vector in zip(window, vectors)])
-        conn.commit()          # commit per batch — an interrupted run keeps its work
+            [(cid, model, dims, emb.pack(v)) for (cid, _), v in zip(window, vectors)])
+        conn.commit()          # per batch: an interrupted run keeps its work
         done += len(window)
         if not quiet and (offset // batch_size) % 20 == 0:
             rate = done / max(time.time() - t0, 1e-6)
             eta = (total - done) / rate if rate else 0
-            print(f"  embedded {done:,}/{total:,}  "
-                  f"({rate:.0f} chunks/s, eta {eta / 60:.1f} min)", file=sys.stderr)
+            print(f"  embedded {done:,}/{total:,} ({rate:.0f}/s, eta {eta/60:.1f} min)",
+                  file=sys.stderr)
     return done, dims
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--db", default=os.environ.get("KF_DB", "/data/kf.db"))
+    parser.add_argument("--db", default=os.environ.get(corpus.DB_ENV, corpus.DEFAULT_DB))
     parser.add_argument("--model", default=emb.DEFAULT_MODEL)
     parser.add_argument("--batch-size", type=int, default=emb.DEFAULT_BATCH)
     parser.add_argument("--chunk-chars", type=int, default=emb.CHUNK_CHARS)
     parser.add_argument("--chunk-overlap", type=int, default=emb.CHUNK_OVERLAP)
-    parser.add_argument("--limit", type=int, default=None,
-                        help="only chunk this many not-yet-chunked documents "
-                             "(for a trial run on a sample)")
-    parser.add_argument("--recompute", action="store_true",
-                        help="drop existing chunks and vectors and rebuild")
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--recompute", action="store_true")
+    parser.add_argument("--reuse", metavar="DB",
+                        help="copy vectors from this earlier index for chunks "
+                             "whose text is unchanged, then embed the rest")
+    parser.add_argument("--status", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -164,8 +167,17 @@ def main(argv=None) -> int:
 
     conn = sqlite3.connect(args.db)
     conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA foreign_keys = ON")
-    ensure_schema(conn)
+    conn.executescript(vectorstore.SCHEMA_SQL)
+    conn.commit()
+
+    if args.status:
+        import db as db_module
+        db_module.set_db_path(args.db)
+        stats = vectorstore.stats(db_module.conn, corpus.PARENT_TABLE)
+        for key, value in stats.items():
+            if key != "recent_runs":
+                print(f"  {key}: {value}")
+        return 0
 
     if args.recompute:
         conn.executescript("DELETE FROM embeddings; DELETE FROM chunks;")
@@ -181,8 +193,10 @@ def main(argv=None) -> int:
 
     t0 = time.time()
     try:
-        n_new_chunks = build_chunks(conn, args.limit, args.chunk_chars,
-                                    args.chunk_overlap, args.quiet)
+        n_new = build_chunks(conn, args.limit, args.chunk_chars,
+                             args.chunk_overlap, args.quiet)
+        if args.reuse and os.path.exists(args.reuse):
+            reuse_vectors(conn, args.reuse, args.model, args.quiet)
         n_embedded, dims = embed_pending(conn, args.model, args.batch_size, args.quiet)
     except emb.EmbeddingError as exc:
         conn.execute("UPDATE embedding_runs SET finished_at=?, notes=? WHERE run_id=?",
@@ -198,17 +212,15 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 130
 
-    n_articles = conn.execute(
-        "SELECT COUNT(DISTINCT doc_id) FROM chunks").fetchone()[0]
+    n_parents = conn.execute("SELECT COUNT(DISTINCT parent_id) FROM chunks").fetchone()[0]
     n_chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
     conn.execute(
-        "UPDATE embedding_runs SET finished_at=?, dims=?, n_articles=?, n_chunks=? "
-        "WHERE run_id=?", (utcnow(), dims or None, n_articles, n_chunks, run_id))
+        "UPDATE embedding_runs SET finished_at=?, dims=?, n_parents=?, n_chunks=? "
+        "WHERE run_id=?", (utcnow(), dims or None, n_parents, n_chunks, run_id))
     conn.commit()
-
-    print(f"Done in {time.time() - t0:.0f}s: +{n_new_chunks:,} chunks, "
-          f"+{n_embedded:,} vectors ({dims or '?'}d, {args.model}); "
-          f"corpus now {n_chunks:,} chunks over {n_articles:,} entries.")
+    print(f"Done in {time.time()-t0:.0f}s: +{n_new:,} chunks, +{n_embedded:,} vectors "
+          f"({dims or '?'}d, {args.model}); corpus now {n_chunks:,} chunks over "
+          f"{n_parents:,} documents.")
     conn.close()
     return 0
 
