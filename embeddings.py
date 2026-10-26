@@ -12,11 +12,16 @@ question and the server answers with the passages that mean the same thing,
 rather than the ones that happen to share keywords. A client cannot embed a
 corpus it never receives, so this cannot live on the client side.
 
-Vectors come from GPUStack (`qwen3-embedding-0.6b`, 1024 dimensions), are
+Vectors come from GPUStack (`qwen3-embedding-4b`, 2560 dimensions), are
 L2-normalised on the way in, and are stored as float32 BLOBs in SQLite. At the
 scale of these corpora — tens of thousands of passages — similarity is an honest
 brute-force dot product over a numpy array: exact results, no index, and no
 recall parameter to get wrong.
+
+The fleet ran on `qwen3-embedding-0.6b` (1024 dimensions) until GPUStack
+withdrew it on 24.10.2026; every provider was re-embedded with 4b on 25./26.10.
+(ch-h-bot#570). A query vector and the stored vectors must come from the same
+model — the model name selects both, here and in `vectorstore.default_model`.
 
 Per-repo configuration is the ENV_PREFIX below and the `clean` callable passed
 to `chunk_document`; nothing else should differ.
@@ -43,7 +48,7 @@ def _env(name: str, default: str) -> str:
                           os.environ.get(f"MCP_{name}", default))
 
 
-DEFAULT_MODEL = _env("EMBED_MODEL", "qwen3-embedding-0.6b")
+DEFAULT_MODEL = _env("EMBED_MODEL", "qwen3-embedding-4b")
 DEFAULT_BASE_URL = os.environ.get("GPUSTACK_BASE_URL", "https://gpustack.unibe.ch/v1")
 DEFAULT_BATCH = int(_env("EMBED_BATCH", "64"))
 
