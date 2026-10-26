@@ -69,7 +69,7 @@ _CACHE: dict[tuple[str, str], Any] = {}
 def default_model() -> str:
     prefix = os.environ.get("MCP_ENV_PREFIX", "MCP")
     return os.environ.get(f"{prefix}_EMBED_MODEL",
-                          os.environ.get("MCP_EMBED_MODEL", "qwen3-embedding-0.6b"))
+                          os.environ.get("MCP_EMBED_MODEL", "qwen3-embedding-4b"))
 
 
 def load_matrix(conn_factory: Callable, db_path: str, model: str):

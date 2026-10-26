@@ -22,7 +22,7 @@ services:
       # UniBE network only, so search_semantic fails there and nowhere else.
       - GPUSTACK_BASE_URL=${GPUSTACK_BASE_URL:-https://gpustack.unibe.ch/v1}
       - GPUSTACK_API_KEY=${GPUSTACK_API_KEY:-}
-      - EOS_EMBED_MODEL=${EOS_EMBED_MODEL:-qwen3-embedding-0.6b}
+      - EOS_EMBED_MODEL=${EOS_EMBED_MODEL:-qwen3-embedding-4b}
     healthcheck:
       # A plain TCP connect: opening the endpoint would start an MCP session and
       # abandon it every 30 seconds.
