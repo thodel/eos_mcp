@@ -17,6 +17,15 @@ What a repo supplies:
 
 Everything else — the schema, the packing, the matrix, the per-parent cap — is
 the same everywhere, which is the point.
+
+Truncated search (ch-h-bot#594, L-6). With ``<PREFIX>_SEARCH_DIMS`` set (e.g. 512),
+the matrix holds only the first d components of each vector, re-normalised — the
+Matryoshka prefix the embedding model is trained to make meaningful — and a search
+re-scores its best ``RERANK`` candidates with the full vectors read from the
+database. Measured on bar_mcp stage 1 (411 163 vectors, 04.11.2026): 512 d alone
+loses a third of the top 10 (overlap .64 with 2 560 d), with re-scoring of the
+best 200 the ranking is the full one (MRR .894 = .894, overlap .98) at a fifth of
+the memory. Unset, nothing changes.
 """
 
 from __future__ import annotations
@@ -63,7 +72,10 @@ CREATE INDEX IF NOT EXISTS ix_chunks_parent ON chunks(parent_id);
 CREATE INDEX IF NOT EXISTS ix_embeddings_model ON embeddings(model);
 """
 
-_CACHE: dict[tuple[str, str], Any] = {}
+_CACHE: dict[tuple, Any] = {}
+
+#: Candidates re-scored with the full vectors in a truncated search.
+RERANK = 200
 
 
 def default_model() -> str:
@@ -72,9 +84,19 @@ def default_model() -> str:
                           os.environ.get("MCP_EMBED_MODEL", "qwen3-embedding-4b"))
 
 
-def load_matrix(conn_factory: Callable, db_path: str, model: str):
-    """(chunk_ids, matrix) for a model, loaded once per (database, model)."""
-    key = (db_path, model)
+def search_dims() -> Optional[int]:
+    """The truncated width from ``<PREFIX>_SEARCH_DIMS``, or None for the full vectors."""
+    prefix = os.environ.get("MCP_ENV_PREFIX", "MCP")
+    raw = os.environ.get(f"{prefix}_SEARCH_DIMS", os.environ.get("MCP_SEARCH_DIMS", "")).strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else None
+
+
+def load_matrix(conn_factory: Callable, db_path: str, model: str, dims: Optional[int] = None):
+    """(chunk_ids, matrix) for a model, loaded once per (database, model, width).
+
+    With ``dims`` below the stored width, each row keeps its first ``dims``
+    components, re-normalised; the full vectors stay on disk."""
+    key = (db_path, model, dims)
     cached = _CACHE.get(key)
     if cached is not None:
         return cached
@@ -105,16 +127,21 @@ def load_matrix(conn_factory: Callable, db_path: str, model: str):
             raise RuntimeError(
                 f"no embeddings for model {model!r} in {db_path}. "
                 "Run embed_db.py to build the semantic index.")
-        dims = c.execute("SELECT dims FROM embeddings WHERE model = ? LIMIT 1",
-                         (model,)).fetchone()[0]
-        matrix = np.empty((n, dims), dtype="<f4")
+        stored = c.execute("SELECT dims FROM embeddings WHERE model = ? LIMIT 1",
+                           (model,)).fetchone()[0]
+        width = dims if dims and dims < stored else stored
+        matrix = np.empty((n, width), dtype="<f4")
         chunk_ids = []
         for i, (chunk_id, vector) in enumerate(c.execute(
                 "SELECT chunk_id, vector FROM embeddings WHERE model = ? ORDER BY rowid",
                 (model,))):
             if i >= n:          # zwischen COUNT und Lauf ist etwas dazugekommen
                 break
-            matrix[i] = np.frombuffer(vector, dtype="<f4")
+            if width == stored:
+                matrix[i] = np.frombuffer(vector, dtype="<f4")
+            else:               # das Präfix, neu normiert — nur `width` Werte bleiben im RAM
+                head = np.frombuffer(vector, dtype="<f4", count=width)
+                matrix[i] = head / (float(np.linalg.norm(head)) or 1.0)
             chunk_ids.append(chunk_id)
         if len(chunk_ids) < n:  # oder weggefallen: die Matrix auf das Gelesene kürzen
             matrix = matrix[:len(chunk_ids)]
@@ -133,12 +160,34 @@ def warm(conn_factory: Callable, db_path: str, model: str) -> dict:
     for the matrix to be assembled.
     """
     try:
-        chunk_ids, matrix = load_matrix(conn_factory, db_path, model)
+        chunk_ids, matrix = load_matrix(conn_factory, db_path, model, search_dims())
     except RuntimeError as exc:
         return {"ready": False, "model": model, "reason": str(exc)}
-    return {"ready": True, "model": model, "n_chunks": len(chunk_ids),
-            "dims": int(matrix.shape[1]),
-            "megabytes": round(matrix.nbytes / 1_048_576, 1)}
+    out = {"ready": True, "model": model, "n_chunks": len(chunk_ids),
+           "dims": int(matrix.shape[1]),
+           "megabytes": round(matrix.nbytes / 1_048_576, 1)}
+    if search_dims():
+        out["rerank"] = RERANK
+    return out
+
+
+def _full_vectors(conn_factory: Callable, model: str, chunk_ids: list) -> dict:
+    """The stored vectors of a few chunks, for re-scoring a truncated search.
+
+    The model is checked here, not in SQL: with ``model = ?`` beside a long IN list the
+    planner takes ``ix_embeddings_model`` and walks every row of the model — measured on
+    bar.db (411 163 vectors, 04.11.2026), 524 ms for 200 vectors instead of 2 ms."""
+    import numpy as np
+    out = {}
+    with conn_factory() as c:
+        for start in range(0, len(chunk_ids), 400):
+            window = chunk_ids[start:start + 400]
+            for cid, m, vector in c.execute(
+                    f"SELECT chunk_id, model, vector FROM embeddings WHERE chunk_id IN "
+                    f"({','.join('?' * len(window))})", window):
+                if m == model:
+                    out[cid] = np.frombuffer(vector, dtype="<f4")
+    return out
 
 
 def search(conn_factory: Callable, db_path: str, query_vector, *,
@@ -158,21 +207,32 @@ def search(conn_factory: Callable, db_path: str, query_vector, *,
     import numpy as np
 
     model = model or default_model()
-    chunk_ids, matrix = load_matrix(conn_factory, db_path, model)
+    dims = search_dims()
+    chunk_ids, matrix = load_matrix(conn_factory, db_path, model, dims)
 
     query = np.asarray(query_vector, dtype="float32")
-    if query.shape[0] != matrix.shape[1]:
+    truncated = matrix.shape[1] < query.shape[0] and dims == matrix.shape[1]
+    if query.shape[0] != matrix.shape[1] and not truncated:
         raise ValueError(
             f"query has {query.shape[0]} dimensions, index has {matrix.shape[1]}")
-    norm = float(np.linalg.norm(query)) or 1.0
-    scores = matrix @ (query / norm)
+    full = query / (float(np.linalg.norm(query)) or 1.0)
+    head = query[:matrix.shape[1]]
+    scores = matrix @ (head / (float(np.linalg.norm(head)) or 1.0))
 
     # Take a generous slice before filtering: row_to_hit and the per-parent cap
     # both discard candidates, so topping up here avoids a second matrix pass.
     fetch = min(len(chunk_ids), max(limit * fetch_multiplier, limit + 50))
+    if truncated:
+        fetch = min(len(chunk_ids), max(fetch, RERANK))
     candidates = np.argpartition(-scores, fetch - 1)[:fetch]
     candidates = candidates[np.argsort(-scores[candidates])]
     picked = [(chunk_ids[i], float(scores[i])) for i in candidates]
+    if truncated:
+        # The prefix found the candidates; the full vectors order them. A row whose
+        # full vector is gone keeps its prefix score rather than vanishing.
+        vectors = _full_vectors(conn_factory, model, [cid for cid, _ in picked[:RERANK]])
+        rescored = [(cid, float(vectors[cid] @ full) if cid in vectors else s) for cid, s in picked[:RERANK]]
+        picked = sorted(rescored, key=lambda p: -p[1]) + picked[RERANK:]
 
     by_id = {}
     with conn_factory() as c:
