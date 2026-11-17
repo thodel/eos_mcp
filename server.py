@@ -30,6 +30,17 @@ def normalise_path(path):
 
 DEFAULT_HTTP_PATH = normalise_path(os.environ.get("EOS_HTTP_PATH", "/mcp"))
 
+#: Stateless streamable HTTP: every request gets a fresh transport and nothing
+#: is kept between requests. No tool here needs a session (no elicitation, no
+#: notifications, no per-client state). In the default stateful mode the SDK
+#: keeps every session until the client sends DELETE, and the Swiss History Bot
+#: never does: it opens one session per tool call (ch-h-bot api/mcp_client.py).
+#: On hsso_mcp that came to about 74 KB per call, linear, until the unit hit
+#: MemoryHigh, swapped and stopped answering (16.11.2026, hsso_mcp PR #2).
+#: tests/test_http_sessions.py holds the property; eval/session_memory.py
+#: measures it against a running server.
+STATELESS_HTTP = True
+
 db_module.set_db_path(DEFAULT_DB)
 
 mcp = MCPServer(
@@ -181,7 +192,7 @@ def main(argv=None):
         logger.warning(f"Could not read DB stats: {e}")
     logger.info(f"Starting EOS MCP server on {args.host}:{args.port}{args.http_path}")
     mcp.run(transport="streamable-http", host=args.host, port=args.port,
-            streamable_http_path=args.http_path)
+            streamable_http_path=args.http_path, stateless_http=STATELESS_HTTP)
 
 if __name__ == "__main__":
     main()
